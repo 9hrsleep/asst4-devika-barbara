@@ -18,6 +18,7 @@
 
 #include <mpi.h>
 #include <unistd.h>
+#include <limits>
 
 void print_stats(const std::vector<std::vector<int>> &occupancy) {
   int max_occupancy = 0;
@@ -502,6 +503,14 @@ int find_best_route_idx(const std::vector<std::vector<int>> &occupancy,
   return best_route_idx;
 }
 
+// message structure to communicate the bends that have changed to other processes
+struct RouteUpdateMessage {
+  int wire_idx;   // if this is -1, there is no change that has been made
+  int num_bends;
+  int bend_x[3];
+  int bend_y[3];
+};
+
 /** across wires: wires are processed in batches of batch_size.
  each thread handles its own batch of wires sequentially.
  logic:
@@ -513,27 +522,36 @@ int find_best_route_idx(const std::vector<std::vector<int>> &occupancy,
 */
 void route_across_wires_MPI(std::vector<Wire> &wires, std::vector<std::vector<int>> &occupancy,
   std::vector<std::vector<int>> &occupancy_T,
-  int SA_iters, double SA_prob, int num_threads, int batch_size) {
+  int SA_iters, double SA_prob, int batch_size, int pid, int nproc) {
   const int num_wires = wires.size();
+  const int num_batches = (num_wires + batch_size - 1) / batch_size;
+  // every process routes one batch per round, so this many rounds covers all batches
+  const int num_rounds = (num_batches + nproc - 1) / nproc;
+
+  std::vector<RouteUpdateMessage> send_updates(batch_size);
+  std::vector<RouteUpdateMessage> recv_updates(batch_size * nproc);
 
   // do iterative algorithm
   for (int iters = 0; iters < SA_iters; iters++) {
-    for (int batch_start = 0; batch_start < num_wires; batch_start += batch_size) {
+    for (int round = 0; round < num_rounds; round++) {
+      int curr_local_batch = round * nproc + pid;
+      int batch_start = curr_local_batch * batch_size;
       // make sure final batch is right size
       int batch_end = std::min(batch_start + batch_size, num_wires);
+
+      // start with every slot empty (want to skip the unused slots when receiving messages)
+      for (auto &update : send_updates) {
+        update.wire_idx = -1;
+      }
 
       // random number generator for simulated annealing, private to this batch
       std::seed_seq seed{676, iters, batch_start};
       std::mt19937 rng(seed);
       std::bernoulli_distribution choose_random_route(SA_prob);
-      // decide randomness up front but leave old routes on the grid
-      // wires in the same batch don't see each other's new routes until all
-      // choices are ready, so there can be staler information
+
       for (int w = batch_start; w < batch_end; w++) {
         // batch_idx is wire's position in current batch
         int batch_idx = w - batch_start;
-        // reset to false
-        search_curr_wire[batch_idx] = false;
         if (wires[w].num_bends == 0) {
           continue;
         }
@@ -541,7 +559,7 @@ void route_across_wires_MPI(std::vector<Wire> &wires, std::vector<std::vector<in
         update_occupancy_with_wire(occupancy, occupancy_T, old_wire, -1);
         int num_routes = count_routes(old_wire);
         int chosen_idx;
-        
+
         // stimulated annealing
         if (choose_random_route(rng)) {
           std::uniform_int_distribution<int> pick(0, num_routes - 1);
@@ -550,9 +568,41 @@ void route_across_wires_MPI(std::vector<Wire> &wires, std::vector<std::vector<in
           chosen_idx = find_best_route_idx(occupancy, occupancy_T, old_wire, num_routes);
         }
 
-        // place best "chosen" wire
+        // place best "chosen" wire in our own copy right away
         wires[w] = build_route(old_wire, chosen_idx);
         update_occupancy_with_wire(occupancy, occupancy_T, wires[w], +1);
+
+        // remember the new route so we can tell the other processes
+        RouteUpdateMessage &update = send_updates[batch_idx];
+        update.wire_idx = w;
+        update.num_bends = wires[w].num_bends;
+        for (int b = 0; b < wires[w].num_bends; b++) {
+          update.bend_x[b] = wires[w].bends[b].x;
+          update.bend_y[b] = wires[w].bends[b].y;
+        }
+      }
+
+      // everyone sends their batch's updates to everyone
+      MPI_Allgather(send_updates.data(), batch_size * 8, MPI_INT, recv_updates.data(), batch_size * 8, MPI_INT, MPI_COMM_WORLD);
+
+      // apply other processes' updates (take old route off, put new route on)
+      for (int r = 0; r < nproc; r++) {
+        if (r == pid) {
+          continue; // skip own updates
+        }
+        for (int k = 0; k < batch_size; k++) {
+          const RouteUpdateMessage &update = recv_updates[r * batch_size + k];
+          if (update.wire_idx < 0) {
+            continue; // skip if it is an unused slot
+          }
+          Wire &wire = wires[update.wire_idx];
+          update_occupancy_with_wire(occupancy, occupancy_T, wire, -1);
+          wire.num_bends = update.num_bends;
+          for (int b = 0; b < update.num_bends; b++) {
+            wire.bends[b] = {update.bend_x[b], update.bend_y[b]};
+          }
+          update_occupancy_with_wire(occupancy, occupancy_T, wire, +1);
+        }
       }
     }
   }
@@ -623,30 +673,29 @@ int main(int argc, char *argv[]) {
 
   int dim_x, dim_y, num_wires;
   std::vector<Wire> wires;
-  std::vector<std::vector<int>> occupancy;
 
-  if (pid == 0) {
-      std::ifstream fin(input_filename);
+  std::ifstream fin(input_filename);
 
-      if (!fin) {
-        std::cerr << "Unable to open file: " << input_filename << ".\n";
-        exit(EXIT_FAILURE);
-      }
+  if (!fin) {
+    std::cerr << "Unable to open file: " << input_filename << ".\n";
+    exit(EXIT_FAILURE);
+  }
 
-      /* Read the grid dimension and wire information from file */
-      fin >> dim_x >> dim_y >> num_wires;
+  /* Read the grid dimension and wire information from file */
+  fin >> dim_x >> dim_y >> num_wires;
 
-      wires.resize(num_wires);
-      for (auto &wire : wires) {
-        fin >> wire.start_x >> wire.start_y >> wire.end_x >> wire.end_y;
-        wire.move_x_start = true;
-        wire.move_x_end = false;
-        wire.mid_x = wire.end_x;
-        wire.mid_y = wire.start_y;
-      }
+  wires.resize(num_wires);
+  for (auto &wire : wires) {
+    fin >> wire.start_x >> wire.start_y >> wire.end_x >> wire.end_y;
+    // wire.move_x_start = true;
+    // wire.move_x_end = false;
+    // wire.mid_x = wire.end_x;
+    // wire.mid_y = wire.start_y;
   }
 
   /* Initialize any additional data structures needed in the algorithm */
+  std::vector<std::vector<int>> occupancy(dim_y, std::vector<int>(dim_x));
+  std::vector<std::vector<int>> occupancy_T(dim_x, std::vector<int>(dim_y));
 
   if (pid == 0) {
     const double init_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - init_start).count();
@@ -682,10 +731,11 @@ int main(int argc, char *argv[]) {
       update_occupancy_with_wire(occupancy, occupancy_T, wire, 1);
     }
   }
-  // initialize wires
-  // Within wires
-  route_across_wires(wires, occupancy, occupancy_T, SA_iters, SA_prob, num_threads, batch_size);
+  
+  route_across_wires_MPI(wires, occupancy, occupancy_T, SA_iters, SA_prob, batch_size, pid, nproc);
 
+  // wait for every process to finish
+  MPI_Barrier(MPI_COMM_WORLD);
 
   if (pid == 0) {
     const double compute_time = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - compute_start).count();
@@ -712,6 +762,12 @@ int main(int argc, char *argv[]) {
 */
 validate_wire_t Wire::to_validate_format(void) const {
   validate_wire_t w;
-  
+  // keypoints are start, every bend, then end
+  w.num_pts = num_bends + 2;
+  for (int i = 0; i < w.num_pts; i++) {
+    Point pt = get_point_i(*this, i);
+    w.p[i].x = pt.x;
+    w.p[i].y = pt.y;
+  }
   return w;
 }
